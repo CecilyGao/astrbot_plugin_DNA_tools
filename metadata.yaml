@@ -1,5 +1,5 @@
 name: astrbot_plugin_DNA_tools
-display_name: DNA 分析工具插件
+display_name: DNA 序列分析工具插件
 desc: 参考擎科生物官网云工具，实现DNA格式化、反向互补、翻译、gc含量、引物分析、酶切位点分析功能
 version: v0.0.1
 author: CecilyGao
