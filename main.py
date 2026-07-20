@@ -4,7 +4,13 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
-@register("dna_tools", "YourName", "DNA序列分析工具集（格式化、反向互补、翻译、GC含量、引物分析、酶切位点）", "1.0.0")
+@register(
+    "astrbot_plugin_DNA_tools",
+    "CecilyGao",
+    "参考擎科生物官网云工具，实现DNA格式化、反向互补、翻译、gc含量、引物分析、酶切位点分析功能",
+    "0.0.1",
+    "https://github.com/CecilyGao/astrbot_plugin_DNA_tools"
+)
 class DNAPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
