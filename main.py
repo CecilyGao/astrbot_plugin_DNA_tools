@@ -1,15 +1,10 @@
 import re
 from typing import List, Optional, Tuple
-
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
-
-
 # ======================== 常量 ========================
 ALLOWED_BASES = set("ATCGUN")
-
-
 # ======================== 主插件类 ========================
 @register(
     "astrbot_plugin_DNA_tools",
@@ -34,13 +29,74 @@ class DNAPlugin(Star):
         group_id = str(event.get_group_id())
         return group_id in self.group_whitelist
 
-    # ======================== 参数解析辅助 ========================
+    # ======================== 主命令入口（手动解析） ========================
+    @filter.command("DNA", alias={'dna'})
+    async def dna_command(self, event: AstrMessageEvent):
+        if not self._check_group_permission(event):
+            yield event.plain_result("❌ 当前群未在DNA工具白名单中。")
+            return
+
+        # 获取完整消息并去除命令前缀（例如 "DNA " 或 "dna "）
+        full_text = event.message_str.strip()
+        # 移除命令本身（不区分大小写），只保留子命令和参数
+        # 由于命令可能带有别名，我们通过正则或简单分割来处理
+        # 简单方法：按空格分割，第一个是命令，后面的是子命令和参数
+        parts = full_text.split()
+        if len(parts) < 2:
+            # 只有命令，没有子命令 -> 显示帮助
+            yield event.plain_result(self._get_help())
+            return
+
+        subcmd = parts[1].lower()
+        args = parts[2:] if len(parts) > 2 else []
+
+        # 帮助命令
+        if subcmd in ['help', '帮助']:
+            yield event.plain_result(self._get_help())
+            return
+
+        # 需要序列的子命令列表
+        seq_required_cmds = ['format', '格式化', 'reverse', '反向互补', 
+                             'translate', '翻译', 'gc', 'gc含量',
+                             'primer', '引物分析', 'restriction', '酶切']
+        if subcmd in seq_required_cmds:
+            seq = self._extract_sequence(args)
+            if seq is None:
+                yield event.plain_result("⚠️ 请提供有效的DNA序列（只允许 A、T、C、G、U、N），例如：`DNA format ATCG`")
+                return
+        else:
+            # 未知子命令
+            yield event.plain_result(f"❌ 未知子命令：{subcmd}\n" + self._get_help())
+            return
+
+        # 子命令分发
+        if subcmd in ['format', '格式化']:
+            result = await self._cmd_format(seq)
+            yield event.plain_result(result)
+        elif subcmd in ['reverse', '反向互补']:
+            result = await self._cmd_reverse(seq)
+            yield event.plain_result(result)
+        elif subcmd in ['translate', '翻译']:
+            result = await self._cmd_translate(seq)
+            yield event.plain_result(result)
+        elif subcmd in ['gc', 'gc含量']:
+            result = await self._cmd_gc(seq)
+            yield event.plain_result(result)
+        elif subcmd in ['primer', '引物分析']:
+            result = await self._cmd_primer(seq)
+            yield event.plain_result(result)
+        elif subcmd in ['restriction', '酶切']:
+            result = await self._cmd_restriction(seq)
+            yield event.plain_result(result)
+        else:
+            yield event.plain_result(f"❌ 未知子命令：{subcmd}\n" + self._get_help())
+
+    # ======================== 参数提取辅助 ========================
     @staticmethod
-    def _extract_sequence(args: tuple) -> Optional[str]:
-        """从命令参数中提取并清洗DNA序列"""
+    def _extract_sequence(args: List[str]) -> Optional[str]:
+        """从命令参数列表中提取并清洗DNA序列"""
         if not args:
             return None
-        # 将所有参数拼接成一个字符串，去除空白字符并转为大写
         raw = ''.join(args).replace(' ', '').replace('\n', '').replace('\r', '')
         seq = raw.upper()
         if not seq:
@@ -50,63 +106,13 @@ class DNAPlugin(Star):
             return None
         return seq
 
-    # ======================== 主命令入口 ========================
-    @filter.command("DNA", alias={'dna'})
-    async def dna_command(self, event: AstrMessageEvent, subcommand: str = None, *args):
-        if not self._check_group_permission(event):
-            yield event.plain_result("❌ 当前群未在DNA工具白名单中。")
-            return
-
-        # 无子命令或 help 则显示帮助
-        if not subcommand or subcommand.lower() in ['help', '帮助']:
-            yield event.plain_result(self._get_help())
-            return
-
-        cmd = subcommand.lower()
-
-        # 需要序列的子命令列表
-        seq_required_cmds = ['format', '格式化', 'reverse', '反向互补', 
-                             'translate', '翻译', 'gc', 'gc含量',
-                             'primer', '引物分析', 'restriction', '酶切']
-        if cmd in seq_required_cmds:
-            seq = self._extract_sequence(args)
-            if seq is None:
-                yield event.plain_result("⚠️ 请提供有效的DNA序列（只允许 A、T、C、G、U、N），例如：`DNA format ATCG`")
-                return
-        else:
-            seq = None  # 其他命令（如help）已提前处理
-
-        # 子命令分发
-        if cmd in ['format', '格式化']:
-            result = await self._cmd_format(seq)
-            yield event.plain_result(result)
-        elif cmd in ['reverse', '反向互补']:
-            result = await self._cmd_reverse(seq)
-            yield event.plain_result(result)
-        elif cmd in ['translate', '翻译']:
-            result = await self._cmd_translate(seq)
-            yield event.plain_result(result)
-        elif cmd in ['gc', 'gc含量']:
-            result = await self._cmd_gc(seq)
-            yield event.plain_result(result)
-        elif cmd in ['primer', '引物分析']:
-            result = await self._cmd_primer(seq)
-            yield event.plain_result(result)
-        elif cmd in ['restriction', '酶切']:
-            result = await self._cmd_restriction(seq)
-            yield event.plain_result(result)
-        else:
-            yield event.plain_result(f"❌ 未知子命令：{subcommand}\n" + self._get_help())
-
-    # ======================== 子命令实现 ========================
+    # ======================== 子命令实现（保持不变） ========================
     async def _cmd_format(self, seq: str) -> str:
-        """格式化序列，每行指定宽度"""
         width = self.format_width
         formatted = '\n'.join([seq[i:i+width] for i in range(0, len(seq), width)])
         return f"📄 格式化结果（每行{width}个碱基）：\n{formatted}"
 
     async def _cmd_reverse(self, seq: str) -> str:
-        """反向互补"""
         complement = {
             'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C',
             'U': 'A', 'N': 'N'
@@ -115,7 +121,6 @@ class DNAPlugin(Star):
         return f"🧬 反向互补序列：\n{rev_comp}"
 
     async def _cmd_translate(self, seq: str) -> str:
-        """翻译为氨基酸（标准密码子表）"""
         codon_table = {
             'ATA':'I', 'ATC':'I', 'ATT':'I', 'ATG':'M',
             'ACA':'T', 'ACC':'T', 'ACG':'T', 'ACT':'T',
@@ -135,21 +140,18 @@ class DNAPlugin(Star):
             'TGC':'C', 'TGT':'C', 'TGA':'*', 'TGG':'W',
         }
         protein = []
-        # 从第一个碱基开始，每次取3个
         for i in range(0, len(seq) - 2, 3):
             codon = seq[i:i+3].upper()
             protein.append(codon_table.get(codon, 'X'))
         return f"🧪 翻译结果（标准密码子表）：\n{''.join(protein)}"
 
     async def _cmd_gc(self, seq: str) -> str:
-        """GC含量 + 简单重复序列查找"""
         gc = self._gc_content(seq)
         repeats = self._find_simple_repeats(seq)
         repeat_str = ', '.join(repeats[:5]) if repeats else "无"
         return f"📊 GC含量：{gc:.2f}%\n🔁 重复序列（长度2-6，仅显示前5个）：{repeat_str}"
 
     async def _cmd_primer(self, seq: str) -> str:
-        """引物分析：GC%和Tm值"""
         gc = self._gc_content(seq)
         tm = self._calculate_tm(seq)
         return (f"🧬 引物分析：\n"
@@ -158,7 +160,6 @@ class DNAPlugin(Star):
                 f"Tm值（简单公式）：{tm:.2f} °C")
 
     async def _cmd_restriction(self, seq: str) -> str:
-        """酶切位点查找"""
         sites = self._find_restriction_sites(seq)
         if sites:
             lines = ["🔬 发现的酶切位点："]
@@ -168,7 +169,7 @@ class DNAPlugin(Star):
         else:
             return "❌ 未发现已知酶切位点。"
 
-    # ======================== 核心功能函数（纯计算） ========================
+    # ======================== 核心功能函数 ========================
     def _gc_content(self, seq: str) -> float:
         seq = seq.upper()
         if not seq:
@@ -177,7 +178,6 @@ class DNAPlugin(Star):
         return gc / len(seq) * 100
 
     def _find_simple_repeats(self, seq: str, max_len: int = 6) -> List[str]:
-        """查找长度在2~max_len之间的重复子串（简单实现）"""
         repeats = set()
         seq_upper = seq.upper()
         for length in range(2, max_len + 1):
@@ -188,14 +188,12 @@ class DNAPlugin(Star):
         return sorted(list(repeats), key=lambda x: len(x), reverse=True)
 
     def _calculate_tm(self, seq: str) -> float:
-        """简单Tm公式：Tm = 4*(G+C) + 2*(A+T)（适用于短于14bp）"""
         seq = seq.upper()
         gc = seq.count('G') + seq.count('C')
         at = len(seq) - gc
         return 4 * gc + 2 * at
 
     def _find_restriction_sites(self, seq: str) -> List[Tuple[str, str, int]]:
-        """查找常见酶切位点，返回 (酶名, 识别序列, 起始位置) 列表"""
         enzymes = {
             'EcoRI': 'GAATTC',
             'BamHI': 'GGATCC',
