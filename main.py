@@ -1,26 +1,100 @@
 import re
+import math
 from typing import List, Optional, Tuple
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
+
+# ======================== BioPython 导入 ========================
+try:
+    from Bio.Seq import Seq
+    from Bio.SeqUtils import GC, MeltingTemp as mt
+    from Bio.Restriction import Restriction
+    from Bio.Data import CodonTable
+    BIOPYTHON_AVAILABLE = True
+except ImportError:
+    BIOPYTHON_AVAILABLE = False
+    logger.warning("BioPython 未安装，部分功能将使用简化算法。")
+
 # ======================== 常量 ========================
 ALLOWED_BASES = set("ATCGUN")
+
+# ======================== 常用限制酶列表（名称 -> 识别序列） ========================
+# 包含 4bp、6bp、8bp 识别位点的常见酶，供回退模式使用
+# 注：BioPython 可用时，将直接使用其酶对象，该字典仅作为备用字符串查找
+COMMON_ENZYMES = {
+    # 4bp 切点酶
+    'AluI': 'AGCT',
+    'HaeIII': 'GGCC',
+    'MspI': 'CCGG',
+    'TaqI': 'TCGA',
+    'RsaI': 'GTAC',
+    'HinfI': 'GANTC',      # 含简并
+    'MboI': 'GATC',
+    'Sau3AI': 'GATC',
+    'DpnI': 'GATC',        # 甲基化敏感，但此处仅识别序列
+    'BstUI': 'CGCG',
+    'HpaII': 'CCGG',
+    'MaeI': 'CTAG',
+    'MnlI': 'CCTC',
+    # 6bp 切点酶
+    'EcoRI': 'GAATTC',
+    'BamHI': 'GGATCC',
+    'HindIII': 'AAGCTT',
+    'NotI': 'GCGGCCGC',    # 8bp
+    'XbaI': 'TCTAGA',
+    'SalI': 'GTCGAC',
+    'PstI': 'CTGCAG',
+    'SmaI': 'CCCGGG',
+    'KpnI': 'GGTACC',
+    'SacI': 'GAGCTC',
+    'NcoI': 'CCATGG',
+    'NdeI': 'CATATG',
+    'XhoI': 'CTCGAG',
+    'SpeI': 'ACTAGT',
+    'BglII': 'AGATCT',
+    'MfeI': 'CAATTG',
+    'ClaI': 'ATCGAT',
+    'HpaI': 'GTTAAC',
+    'MluI': 'ACGCGT',
+    'NheI': 'GCTAGC',
+    'AgeI': 'ACCGGT',
+    'BsrGI': 'TGTACA',
+    'BstEII': 'GGTNACC',   # 含简并
+    'BstXI': 'CCANNNNNNTGG',
+    'DraI': 'TTTAAA',
+    'EcoRV': 'GATATC',
+    'HincII': 'GTYRAC',    # 含简并
+    'PvuII': 'CAGCTG',
+    'ScaI': 'AGTACT',
+    'SphI': 'GCATGC',
+    'StuI': 'AGGCCT',
+    'AatII': 'GACGTC',
+    'BglI': 'GCCNNNNNGGC',
+    'NruI': 'TCGCGA',
+    'SfiI': 'GGCCNNNNNGGCC', # 8bp
+    'BspHI': 'TCATGA',
+    'XcmI': 'CCANNNNNNNNNTGG',
+    # 更多...
+}
+
 # ======================== 主插件类 ========================
 @register(
     "astrbot_plugin_DNA_tools",
     "CecilyGao",
-    "参考擎科生物官网云工具，实现DNA格式化、反向互补、翻译、gc含量、引物分析、酶切位点分析功能",
-    "0.1.0",
+    "参考擎科生物官网云工具，使用 BioPython 实现更准确的 DNA 分析",
+    "0.0.1",
     "https://github.com/CecilyGao/astrbot_plugin_DNA_tools"
 )
 class DNAPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        # 群白名单配置（留空则所有群可用）
         self.group_whitelist = config.get('group_whitelist', [])
-        # 格式化每行宽度（可配置）
         self.format_width = config.get('format_width', 60)
+        # Tm 计算参数（可配置）
+        self.salt_conc = config.get('salt_conc', 0.05)      # 单价阳离子浓度 (M)
+        self.primer_conc = config.get('primer_conc', 0.2)   # 引物浓度 (μM)
 
     # ======================== 权限辅助 ========================
     def _check_group_permission(self, event: AstrMessageEvent) -> bool:
@@ -29,98 +103,195 @@ class DNAPlugin(Star):
         group_id = str(event.get_group_id())
         return group_id in self.group_whitelist
 
-    # ======================== 主命令入口（手动解析） ========================
+    # ======================== 主命令入口 ========================
     @filter.command("DNA", alias={'dna'})
     async def dna_command(self, event: AstrMessageEvent):
         if not self._check_group_permission(event):
-            yield event.plain_result("❌ 当前群未在DNA工具白名单中。")
+            yield event.plain_result("❌ 当前群未在 DNA 工具白名单中。")
             return
 
-        # 获取完整消息并去除命令前缀（例如 "DNA " 或 "dna "）
         full_text = event.message_str.strip()
-        # 移除命令本身（不区分大小写），只保留子命令和参数
-        # 由于命令可能带有别名，我们通过正则或简单分割来处理
-        # 简单方法：按空格分割，第一个是命令，后面的是子命令和参数
         parts = full_text.split()
         if len(parts) < 2:
-            # 只有命令，没有子命令 -> 显示帮助
             yield event.plain_result(self._get_help())
             return
 
         subcmd = parts[1].lower()
         args = parts[2:] if len(parts) > 2 else []
 
-        # 帮助命令
         if subcmd in ['help', '帮助']:
             yield event.plain_result(self._get_help())
             return
 
-        # 需要序列的子命令列表
         seq_required_cmds = ['format', '格式化', 'reverse', '反向互补', 
                              'translate', '翻译', 'gc', 'gc含量',
                              'primer', '引物分析', 'restriction', '酶切']
         if subcmd in seq_required_cmds:
             seq = self._extract_sequence(args)
             if seq is None:
-                yield event.plain_result("⚠️ 请提供有效的DNA序列（只允许 A、T、C、G、U、N），例如：`DNA format ATCG`")
+                yield event.plain_result("⚠️ 请提供有效的 DNA 序列（只允许 A、T、C、G、U、N），例如：`DNA format ATCG`")
                 return
         else:
-            # 未知子命令
             yield event.plain_result(f"❌ 未知子命令：{subcmd}\n" + self._get_help())
             return
 
         # 子命令分发
         if subcmd in ['format', '格式化']:
             result = await self._cmd_format(seq)
-            yield event.plain_result(result)
         elif subcmd in ['reverse', '反向互补']:
             result = await self._cmd_reverse(seq)
-            yield event.plain_result(result)
         elif subcmd in ['translate', '翻译']:
             result = await self._cmd_translate(seq)
-            yield event.plain_result(result)
         elif subcmd in ['gc', 'gc含量']:
             result = await self._cmd_gc(seq)
-            yield event.plain_result(result)
         elif subcmd in ['primer', '引物分析']:
             result = await self._cmd_primer(seq)
-            yield event.plain_result(result)
         elif subcmd in ['restriction', '酶切']:
             result = await self._cmd_restriction(seq)
-            yield event.plain_result(result)
         else:
-            yield event.plain_result(f"❌ 未知子命令：{subcmd}\n" + self._get_help())
+            result = f"❌ 未知子命令：{subcmd}\n" + self._get_help()
+        yield event.plain_result(result)
 
-    # ======================== 参数提取辅助 ========================
+    # ======================== 参数提取 ========================
     @staticmethod
     def _extract_sequence(args: List[str]) -> Optional[str]:
-        """从命令参数列表中提取并清洗DNA序列"""
         if not args:
             return None
         raw = ''.join(args).replace(' ', '').replace('\n', '').replace('\r', '')
         seq = raw.upper()
         if not seq:
             return None
-        # 校验序列（只允许 A、T、C、G、U、N）
         if not set(seq).issubset(ALLOWED_BASES):
             return None
         return seq
 
-    # ======================== 子命令实现（保持不变） ========================
+    # ======================== 各子命令实现 ========================
     async def _cmd_format(self, seq: str) -> str:
         width = self.format_width
         formatted = '\n'.join([seq[i:i+width] for i in range(0, len(seq), width)])
-        return f"📄 格式化结果（每行{width}个碱基）：\n{formatted}"
+        return f"📄 格式化结果（每行 {width} 个碱基）：\n{formatted}"
 
     async def _cmd_reverse(self, seq: str) -> str:
-        complement = {
-            'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C',
-            'U': 'A', 'N': 'N'
-        }
-        rev_comp = ''.join(complement.get(base, base) for base in reversed(seq))
+        if BIOPYTHON_AVAILABLE:
+            try:
+                rev_comp = str(Seq(seq).reverse_complement())
+            except Exception as e:
+                logger.error(f"BioPython reverse complement error: {e}")
+                rev_comp = self._fallback_reverse_complement(seq)
+        else:
+            rev_comp = self._fallback_reverse_complement(seq)
         return f"🧬 反向互补序列：\n{rev_comp}"
 
     async def _cmd_translate(self, seq: str) -> str:
+        if BIOPYTHON_AVAILABLE:
+            try:
+                codon_table = CodonTable.unambiguous_dna_by_name["Standard"]
+                protein = str(Seq(seq).translate(table=codon_table, stop_symbol="*"))
+            except Exception as e:
+                logger.error(f"BioPython translate error: {e}")
+                protein = self._fallback_translate(seq)
+        else:
+            protein = self._fallback_translate(seq)
+        return f"🧪 翻译结果（标准密码子表）：\n{protein}"
+
+    async def _cmd_gc(self, seq: str) -> str:
+        if BIOPYTHON_AVAILABLE:
+            try:
+                gc = GC(seq)
+            except Exception as e:
+                logger.error(f"BioPython GC error: {e}")
+                gc = self._fallback_gc(seq)
+        else:
+            gc = self._fallback_gc(seq)
+        repeats = self._find_simple_repeats(seq)
+        repeat_str = ', '.join(repeats[:5]) if repeats else "无"
+        return f"📊 GC 含量：{gc:.2f}%\n🔁 重复序列（长度2-6，仅显示前5个）：{repeat_str}"
+
+    async def _cmd_primer(self, seq: str) -> str:
+        # 使用 BioPython 计算 Tm（最近邻法，含盐校正）
+        if BIOPYTHON_AVAILABLE:
+            try:
+                tm = mt.Tm_NN(Seq(seq),
+                              Na=self.salt_conc,
+                              K=0.0,
+                              Tris=0.0,
+                              Mg=0.0,
+                              dNTPs=0.0,
+                              salt_correction=mt.salt_correction_schildkraut,
+                              DNA=True,
+                              self_comp=False)
+            except Exception as e:
+                logger.error(f"BioPython Tm calculation error: {e}")
+                tm = self._fallback_tm(seq)
+        else:
+            tm = self._fallback_tm(seq)
+
+        gc = self._gc_content(seq)  # 统一用我们自己的 GC 计算（也可直接用 BioPython）
+        return (f"🧬 引物分析（使用 BioPython 最近邻法，盐浓度 {self.salt_conc} M，引物浓度 {self.primer_conc} μM）：\n"
+                f"序列：{seq}\n"
+                f"GC 含量：{gc:.2f}%\n"
+                f"Tm 值（修正后）：{tm:.2f} °C")
+
+    async def _cmd_restriction(self, seq: str) -> str:
+        """
+        查找限制酶切位点。
+        若 BioPython 可用，则使用其酶对象进行模糊匹配（支持简并碱基）；
+        否则回退到内置字典进行精确字符串查找。
+        """
+        if BIOPYTHON_AVAILABLE:
+            try:
+                seq_obj = Seq(seq)
+                found = []
+                # 遍历常用酶列表
+                for enzyme_name in COMMON_ENZYMES.keys():
+                    try:
+                        enzyme = getattr(Restriction, enzyme_name)
+                    except AttributeError:
+                        # 如果 BioPython 中没有该酶，则跳过
+                        continue
+                    # 搜索该酶的所有切割位点（返回位置列表）
+                    sites = enzyme.search(seq_obj)
+                    if sites:
+                        # 获取识别序列（可能含简并碱基）
+                        site_seq = str(enzyme.site)
+                        for pos in sites:
+                            found.append((enzyme_name, site_seq, pos))
+                if found:
+                    lines = ["🔬 发现的酶切位点（使用 BioPython 搜索）："]
+                    for name, site, pos in found:
+                        lines.append(f"  {name} 识别序列 {site} 切割位置 {pos}")
+                    return "\n".join(lines)
+                else:
+                    return "❌ 未发现已知酶切位点。"
+            except Exception as e:
+                logger.error(f"BioPython restriction error: {e}")
+                return self._fallback_restriction(seq)
+        else:
+            return self._fallback_restriction(seq)
+
+    # ======================== 回退函数（BioPython 不可用时使用） ========================
+    def _gc_content(self, seq: str) -> float:
+        """统一 GC 含量计算（优先使用 BioPython）"""
+        if BIOPYTHON_AVAILABLE:
+            try:
+                return GC(seq)
+            except:
+                return self._fallback_gc(seq)
+        else:
+            return self._fallback_gc(seq)
+
+    def _fallback_gc(self, seq: str) -> float:
+        seq = seq.upper()
+        if not seq:
+            return 0.0
+        gc = seq.count('G') + seq.count('C')
+        return gc / len(seq) * 100
+
+    def _fallback_reverse_complement(self, seq: str) -> str:
+        complement = {'A':'T','T':'A','C':'G','G':'C','U':'A','N':'N'}
+        return ''.join(complement.get(base, base) for base in reversed(seq))
+
+    def _fallback_translate(self, seq: str) -> str:
         codon_table = {
             'ATA':'I', 'ATC':'I', 'ATT':'I', 'ATG':'M',
             'ACA':'T', 'ACC':'T', 'ACG':'T', 'ACT':'T',
@@ -143,39 +314,29 @@ class DNAPlugin(Star):
         for i in range(0, len(seq) - 2, 3):
             codon = seq[i:i+3].upper()
             protein.append(codon_table.get(codon, 'X'))
-        return f"🧪 翻译结果（标准密码子表）：\n{''.join(protein)}"
+        return ''.join(protein)
 
-    async def _cmd_gc(self, seq: str) -> str:
-        gc = self._gc_content(seq)
-        repeats = self._find_simple_repeats(seq)
-        repeat_str = ', '.join(repeats[:5]) if repeats else "无"
-        return f"📊 GC含量：{gc:.2f}%\n🔁 重复序列（长度2-6，仅显示前5个）：{repeat_str}"
+    def _fallback_tm(self, seq: str) -> float:
+        # 简单 Wallace 公式（短引物适用）
+        gc = seq.upper().count('G') + seq.upper().count('C')
+        at = len(seq) - gc
+        return 4 * gc + 2 * at
 
-    async def _cmd_primer(self, seq: str) -> str:
-        gc = self._gc_content(seq)
-        tm = self._calculate_tm(seq)
-        return (f"🧬 引物分析：\n"
-                f"序列：{seq}\n"
-                f"GC含量：{gc:.2f}%\n"
-                f"Tm值（简单公式）：{tm:.2f} °C")
-
-    async def _cmd_restriction(self, seq: str) -> str:
-        sites = self._find_restriction_sites(seq)
-        if sites:
-            lines = ["🔬 发现的酶切位点："]
-            for enzyme, site, pos in sites:
+    def _fallback_restriction(self, seq: str) -> str:
+        """回退模式：使用内置字典进行精确字符串查找（不支持简并碱基）"""
+        found = []
+        seq_upper = seq.upper()
+        for enzyme, site in COMMON_ENZYMES.items():
+            pos = seq_upper.find(site)
+            if pos != -1:
+                found.append((enzyme, site, pos))
+        if found:
+            lines = ["🔬 发现的酶切位点（使用内置字典精确匹配）："]
+            for enzyme, site, pos in found:
                 lines.append(f"  {enzyme} 识别序列 {site} 位置 {pos}")
             return "\n".join(lines)
         else:
             return "❌ 未发现已知酶切位点。"
-
-    # ======================== 核心功能函数 ========================
-    def _gc_content(self, seq: str) -> float:
-        seq = seq.upper()
-        if not seq:
-            return 0.0
-        gc = seq.count('G') + seq.count('C')
-        return gc / len(seq) * 100
 
     def _find_simple_repeats(self, seq: str, max_len: int = 6) -> List[str]:
         repeats = set()
@@ -187,46 +348,19 @@ class DNAPlugin(Star):
                     repeats.add(sub)
         return sorted(list(repeats), key=lambda x: len(x), reverse=True)
 
-    def _calculate_tm(self, seq: str) -> float:
-        seq = seq.upper()
-        gc = seq.count('G') + seq.count('C')
-        at = len(seq) - gc
-        return 4 * gc + 2 * at
-
-    def _find_restriction_sites(self, seq: str) -> List[Tuple[str, str, int]]:
-        enzymes = {
-            'EcoRI': 'GAATTC',
-            'BamHI': 'GGATCC',
-            'HindIII': 'AAGCTT',
-            'NotI': 'GCGGCCGC',
-            'XbaI': 'TCTAGA',
-            'SalI': 'GTCGAC',
-            'PstI': 'CTGCAG',
-            'SmaI': 'CCCGGG',
-            'KpnI': 'GGTACC',
-            'SacI': 'GAGCTC',
-        }
-        found = []
-        seq_upper = seq.upper()
-        for enzyme, site in enzymes.items():
-            pos = seq_upper.find(site)
-            if pos != -1:
-                found.append((enzyme, site, pos))
-        return found
-
     # ======================== 帮助信息 ========================
     def _get_help(self) -> str:
-        return (
-            "🧬 DNA工具使用帮助\n"
+        help_text = (
+            "🧬 DNA 工具使用帮助（基于 BioPython 增强版）\n"
             "命令格式：DNA <子命令> [序列]\n\n"
-            "可用子命令（支持英文或中文别名）：\n"
-            "  format / 格式化   <序列>  – 每行60个碱基格式化输出\n"
-            "  reverse / 反向互补 <序列>  – 计算反向互补序列\n"
-            "  translate / 翻译  <序列>  – 使用标准密码子表翻译为氨基酸\n"
-            "  gc / gc含量       <序列>  – 计算GC含量并查找简单重复序列\n"
-            "  primer / 引物分析 <序列>  – 计算GC%和Tm值（短引物公式）\n"
-            "  restriction / 酶切 <序列> – 查找常见酶切位点（EcoRI, BamHI等）\n"
-            "  help / 帮助              – 显示此帮助\n\n"
+            "可用子命令：\n"
+            "  format 或 格式化   <序列>  – 每行60碱基格式化输出\n"
+            "  reverse 或 反向互补 <序列>  – 计算反向互补序列（BioPython 实现）\n"
+            "  translate 或 翻译  <序列>  – 标准密码子表翻译（BioPython 实现）\n"
+            "  gc 或 gc含量       <序列>  – GC 含量（BioPython） + 简单重复序列\n"
+            "  primer 或 引物分析 <序列>  – GC% + Tm 值（最近邻法，含盐校正，BioPython）\n"
+            "  restriction 或 酶切 <序列> – 查找常用限制酶切位点（支持简并，BioPython）\n"
+            "  help 或 帮助              – 显示此帮助\n\n"
             "示例：\n"
             "  DNA format ATCGATCGATCG\n"
             "  DNA 反向互补 ATGC\n"
@@ -234,5 +368,14 @@ class DNAPlugin(Star):
             "  DNA gc ATGCGC\n"
             "  DNA primer ATGCGT\n"
             "  DNA 酶切 GAATTC\n\n"
-            "注意：序列中的空格和换行会被自动忽略，只允许字母 ATCGUN。"
+            "配置项（在插件配置文件中可调整）：\n"
+            "  salt_conc: 单价阳离子浓度 (M)，默认 0.05\n"
+            "  primer_conc: 引物浓度 (μM)，默认 0.2\n"
+            "  format_width: 格式化每行碱基数，默认 60\n"
+            "  group_whitelist: 允许使用的群组 ID 列表，留空则全部可用\n\n"
+            "注意：序列中只允许 A、T、C、G、U、N，空格和换行自动忽略。\n" 
+            "都用本插件了，想必也知道序列应该怎么输入吧。"
         )
+        if not BIOPYTHON_AVAILABLE:
+            help_text += "\n⚠️ BioPython 未安装，已回退至简化算法，建议安装以获得更准确结果。"
+        return help_text
