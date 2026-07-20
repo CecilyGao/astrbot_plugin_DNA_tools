@@ -1,7 +1,7 @@
-name: astrbot_plugin_github_dynamics
-display_name: GitHub 动态推送插件
-desc: 通过 GitHub API 定时获取github用户、仓库动态并推送到聊天会话，支持每个会话独立订阅
-version: v0.1.0
+name: astrbot_plugin_DNA_tools
+display_name: DNA 分析工具插件
+desc: 参考擎科生物官网云工具，实现DNA格式化、反向互补、翻译、gc含量、引物分析、酶切位点分析功能
+version: v0.0.1
 author: CecilyGao
-repo: https://github.com/CecilyGao/astrbot_plugin_github_dynamics
+repo: https://github.com/CecilyGao/astrbot_plugin_DNA_tools
 astrbot_version: ">=4.9.2"
